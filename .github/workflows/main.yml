@@ -1,4 +1,4 @@
-name: "GoldHEN Full PRX Source Dumper"
+name: "GoldHEN Full PRX Decompiler"
 
 on:
   push:
@@ -15,7 +15,7 @@ permissions:
   contents: write
 
 jobs:
-  dump:
+  decompile:
     runs-on: ubuntu-latest
 
     steps:
@@ -45,12 +45,12 @@ jobs:
           unzip -q ghidra.zip -d ghidra
 
           GHIDRA=$(find ghidra -name analyzeHeadless -type f | head -n 1)
-
           test -n "$GHIDRA"
+
           chmod +x "$GHIDRA"
           echo "GHIDRA=$GHIDRA" >> "$GITHUB_ENV"
 
-      - name: Create directories
+      - name: Prepare folders
         run: |
           mkdir -p input scripts output
 
@@ -60,6 +60,7 @@ jobs:
           import ghidra.app.decompiler.*;
           import ghidra.app.script.GhidraScript;
           import ghidra.program.model.listing.*;
+          import ghidra.program.model.symbol.*;
           import java.io.*;
 
           public class Decompile extends GhidraScript {
@@ -75,6 +76,9 @@ jobs:
 
                   PrintWriter symbols = new PrintWriter(
                       new File(out, "symbols.txt"));
+
+                  PrintWriter imports = new PrintWriter(
+                      new File(out, "imports.txt"));
 
                   PrintWriter asm = new PrintWriter(
                       new File(out, "assembly.asm"));
@@ -92,8 +96,8 @@ jobs:
                       DecompileResults result =
                           dc.decompileFunction(f, 120, monitor);
 
-                      c.println(
-                          "\n/* Function: " + f.getName() + " */");
+                      c.println("\n/* Function: " +
+                          f.getName() + " */");
 
                       if (result.decompileCompleted()
                           && result.getDecompiledFunction() != null) {
@@ -103,6 +107,20 @@ jobs:
                           c.println(
                               "/* Decompilation unavailable */");
                       }
+                  }
+
+                  SymbolIterator symbolsIterator =
+                      currentProgram.getSymbolTable().getAllSymbols(true);
+
+                  while (symbolsIterator.hasNext()) {
+                      Symbol s = symbolsIterator.next();
+
+                      if (s.getSymbolType() == SymbolType.FUNCTION) {
+                          continue;
+                      }
+
+                      imports.println(
+                          s.getName() + " @ " + s.getAddress());
                   }
 
                   InstructionIterator instructions =
@@ -116,6 +134,7 @@ jobs:
 
                   c.close();
                   symbols.close();
+                  imports.close();
                   asm.close();
                   dc.dispose();
               }
@@ -133,15 +152,18 @@ jobs:
             NAME=$(basename "$PRX" .prx)
             DEST="output/$NAME"
 
-            mkdir -p "$DEST"
+            mkdir -p "$DEST/original"
 
-            cp "$PRX" "$DEST/original.prx"
+            cp "$PRX" "$DEST/original/$NAME.prx"
 
             file "$PRX" > "$DEST/file_info.txt"
             strings -a "$PRX" > "$DEST/strings.txt"
 
             readelf -a "$PRX" \
               > "$DEST/elf_info.txt" 2>&1 || true
+
+            readelf -r "$PRX" \
+              > "$DEST/relocations.txt" 2>&1 || true
 
             objdump -D "$PRX" \
               > "$DEST/disassembly.txt" 2>&1 || true
@@ -163,14 +185,13 @@ jobs:
             exit 1
           fi
 
-      - name: Generate complete source project
+      - name: Generate recovered source project
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          root = Path("output")
-
-          for plugin in root.iterdir():
+          for plugin in Path("output").iterdir():
               if not plugin.is_dir():
                   continue
 
@@ -178,91 +199,141 @@ jobs:
               inc = plugin / "include"
               asm = plugin / "asm"
               data = plugin / "data"
-              original = plugin / "original"
 
-              for d in (src, inc, asm, data, original):
-                  d.mkdir(parents=True, exist_ok=True)
+              for d in (src, inc, asm, data):
+                  d.mkdir(exist_ok=True)
 
               def read(name):
                   p = plugin / name
                   return p.read_text(errors="replace") if p.exists() else ""
 
-              decompiled = read("decompiled.c")
-              assembly = read("assembly.asm")
+              code = read("decompiled.c")
               symbols = read("symbols.txt")
+              imports = read("imports.txt")
               strings = read("strings.txt")
+              assembly = read("assembly.asm")
               elf = read("elf_info.txt")
+              relocations = read("relocations.txt")
 
+              # Split Ghidra output into individual functions.
+              parts = re.split(
+                  r'(?=/\*\s*Function:)',
+                  code
+              )
+
+              functions = []
+              declarations = []
+
+              for part in parts:
+                  part = part.strip()
+
+                  if not part or "Function:" not in part:
+                      continue
+
+                  match = re.search(
+                      r'/\*\s*Function:\s*(.*?)\s*\*/',
+                      part
+                  )
+
+                  name = (
+                      match.group(1) if match
+                      else f"function_{len(functions)}"
+                  )
+
+                  safe = re.sub(
+                      r'[^A-Za-z0-9_]',
+                      '_',
+                      name
+                  )
+
+                  functions.append(part)
+
+                  (src / f"{safe}.c").write_text(
+                      "/* Reconstructed pseudocode */\n"
+                      + part + "\n"
+                  )
+
+                  declarations.append(
+                      f"/* Recovered: {name} */"
+                  )
+
+              # Combined recovered code.
               (src / "main.c").write_text(
-                  "/* Reconstructed pseudocode */\n" + decompiled
+                  "/* Reconstructed PRX functions */\n\n"
+                  + "\n\n".join(functions)
               )
 
               (src / "functions.c").write_text(
-                  "/* Recovered function output */\n" + decompiled
+                  "\n\n".join(functions)
+              )
+
+              # Imported symbols are not implementations.
+              (data / "imports.txt").write_text(imports)
+
+              (src / "imports.c").write_text(
+                  "/* Imported symbol information is in data/imports.txt */\n"
               )
 
               (src / "hooks.c").write_text(
-                  "/* Hook functions require manual identification */\n"
-              )
-
-              (src / "imports.c").write_text(
-                  "/* Imported functions require manual identification */\n"
-              )
-
-              (src / "unknown_functions.c").write_text(
-                  "/* Unknown functions require manual analysis */\n"
+                  "/* No hook implementation is generated unless "
+                  "Ghidra recovers its function body. */\n"
               )
 
               (inc / "functions.h").write_text(
-                  "#pragma once\n"
-                  "/* Recovered function declarations */\n"
-              )
-
-              (inc / "types.h").write_text(
-                  "#pragma once\n"
-                  "/* Reconstructed types */\n"
-              )
-
-              (inc / "structures.h").write_text(
-                  "#pragma once\n"
-                  "/* Reconstructed structures */\n"
+                  "#pragma once\n\n"
+                  + "\n".join(declarations)
               )
 
               (inc / "imports.h").write_text(
                   "#pragma once\n"
-                  "/* Reconstructed imports */\n"
+                  "/* Imported symbol metadata: data/imports.txt */\n"
+              )
+
+              (inc / "types.h").write_text(
+                  "#pragma once\n"
+                  "/* Types reconstructed by manual review */\n"
+              )
+
+              (inc / "structures.h").write_text(
+                  "#pragma once\n"
+                  "/* Structure definitions require verification */\n"
               )
 
               (asm / "main.asm").write_text(assembly)
-              (asm / "functions.asm").write_text(assembly)
 
-              (data / "strings.txt").write_text(strings)
               (data / "symbols.txt").write_text(symbols)
+              (data / "strings.txt").write_text(strings)
               (data / "elf_info.txt").write_text(elf)
+              (data / "relocations.txt").write_text(relocations)
 
               (plugin / "README.md").write_text(
-                  "# GoldHEN PRX Source Dump\n\n"
-                  "Generated through Ghidra static analysis.\n\n"
-                  "The C files contain reconstructed pseudocode, "
-                  "not guaranteed original C/C++ source.\n"
-                  "Some architecture-specific PRX formats may "
-                  "require additional loaders.\n"
+                  "# GoldHEN PRX Reconstructed Source\n\n"
+                  "Generated using Ghidra static analysis.\n\n"
+                  "The source is reconstructed pseudocode, "
+                  "not guaranteed original source code.\n"
+                  "Unresolved functions, imports and types "
+                  "require manual analysis.\n"
               )
 
               (plugin / "Makefile").write_text(
-                  "# Reconstructed project - not directly buildable\n"
+                  "# Reconstructed analysis project\n"
                   "all:\n"
-                  "\t@echo 'Original SDK and build configuration required.'\n"
+                  "\t@echo 'Original PS4 SDK and build configuration required.'\n"
               )
 
-              binary = plugin / "original.prx"
+              (plugin / "report.txt").write_text(
+                  f"Plugin: {plugin.name}\n"
+                  f"Recovered functions: {len(functions)}\n"
+                  f"Symbols: {len(symbols.splitlines())}\n"
+                  f"Imports: {len(imports.splitlines())}\n"
+              )
 
-              if binary.exists():
-                  binary.rename(original / binary.name)
-
+              print(
+                  f"{plugin.name}: {len(functions)} functions recovered"
+              )
           PY
 
-      - name: Package complete dump
+      - name: Package source dump
         run: |
           cd output
 
@@ -273,13 +344,11 @@ jobs:
           sha256sum GoldHEN-Full-Source-Dump.zip \
             > GoldHEN-Full-Source-Dump.sha256
 
-          ls -lh GoldHEN-Full-Source-Dump.*
-
-      - name: Upload PR artifact
+      - name: Upload pull request artifact
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: GoldHEN-Full-Source-${{ github.sha }}
+          name: GoldHEN-Source-${{ github.sha }}
           path: |
             GoldHEN-Full-Source-Dump.zip
             GoldHEN-Full-Source-Dump.sha256
@@ -318,7 +387,7 @@ jobs:
                 GoldHEN-Full-Source-Dump.zip \
                 GoldHEN-Full-Source-Dump.sha256 \
                 --target "$GITHUB_SHA" \
-                --title "GoldHEN Source Dump $TAG" \
+                --title "GoldHEN Source $TAG" \
                 --generate-notes
             fi
           else
@@ -326,7 +395,7 @@ jobs:
               GoldHEN-Full-Source-Dump.zip \
               GoldHEN-Full-Source-Dump.sha256 \
               --target "$GITHUB_SHA" \
-              --title "GoldHEN Source Dump $TAG" \
+              --title "GoldHEN Source $TAG" \
               --prerelease \
               --generate-notes
           fi
