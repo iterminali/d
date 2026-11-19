@@ -1,0 +1,134 @@
+name: PS4 PRX Source Decompiler
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'input/**'
+      - '.github/workflows/prx-decompile.yml'
+
+jobs:
+  decompile:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Java and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y openjdk-21-jdk unzip jq curl
+
+      - name: Download Ghidra
+        run: |
+          URL=$(curl -s https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/latest \
+            | jq -r '.assets[] | select(.name | test("^ghidra_.*_PUBLIC_.*\\.zip$")) | .browser_download_url' \
+            | head -n 1)
+
+          test -n "$URL"
+          curl -L "$URL" -o ghidra.zip
+          unzip -q ghidra.zip
+          GHIDRA=$(find . -maxdepth 1 -type d -name 'ghidra_*' | head -n 1)
+          echo "GHIDRA=$GHIDRA" >> "$GITHUB_ENV"
+
+      - name: Create decompiler script
+        run: |
+          mkdir -p scripts output
+
+          cat > scripts/Decompile.java <<'JAVA'
+          import ghidra.app.decompiler.*;
+          import ghidra.app.script.GhidraScript;
+          import ghidra.program.model.listing.*;
+          import java.io.*;
+
+          public class Decompile extends GhidraScript {
+              public void run() throws Exception {
+                  File out = new File(getScriptArgs()[0]);
+                  out.mkdirs();
+
+                  DecompInterface dc = new DecompInterface();
+                  dc.openProgram(currentProgram);
+
+                  PrintWriter c = new PrintWriter(
+                      new File(out, "decompiled.c"));
+                  PrintWriter symbols = new PrintWriter(
+                      new File(out, "symbols.txt"));
+                  PrintWriter asm = new PrintWriter(
+                      new File(out, "assembly.txt"));
+
+                  FunctionIterator functions =
+                      currentProgram.getFunctionManager().getFunctions(true);
+
+                  while (functions.hasNext()) {
+                      Function f = functions.next();
+                      symbols.println(
+                          f.getName() + " @ " + f.getEntryPoint());
+
+                      DecompileResults result =
+                          dc.decompileFunction(f, 120, monitor);
+
+                      c.println("\n/* Function: " + f.getName() + " */");
+
+                      if (result.decompileCompleted()
+                          && result.getDecompiledFunction() != null) {
+                          c.println(
+                              result.getDecompiledFunction().getC());
+                      } else {
+                          c.println("/* Decompilation unavailable */");
+                      }
+                  }
+
+                  InstructionIterator instructions =
+                      currentProgram.getListing().getInstructions(true);
+
+                  while (instructions.hasNext()) {
+                      Instruction i = instructions.next();
+                      asm.println(i.getAddress() + "  " + i);
+                  }
+
+                  c.close();
+                  symbols.close();
+                  asm.close();
+                  dc.dispose();
+              }
+          }
+          JAVA
+
+      - name: Decompile PRX files
+        run: |
+          mkdir -p output
+
+          FOUND=0
+
+          for PRX in input/*.prx; do
+            [ -f "$PRX" ] || continue
+            FOUND=1
+
+            NAME=$(basename "$PRX" .prx)
+            DEST="output/$NAME"
+            mkdir -p "$DEST"
+
+            cp "$PRX" "$DEST/original.prx"
+
+            "$GHIDRA/support/analyzeHeadless" \
+              /tmp/ghidra-project \
+              "$NAME" \
+              -import "$PRX" \
+              -scriptPath scripts \
+              -postScript Decompile.java "$DEST" \
+              -deleteProject || echo "Analysis failed: $NAME"
+
+          done
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "No PRX files found in input/"
+            exit 1
+          fi
+
+      - name: Upload source dump
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoldHEN-PRX-Source-Dump
+          path: output/
+          if-no-files-found: error
