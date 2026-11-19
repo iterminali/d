@@ -1,25 +1,25 @@
-name: "GoldHEN PRX Source Dumper"
+name: "GoldHEN Full PRX Source Dumper"
 
 on:
   push:
     paths:
       - "input/**"
-      - ".github/workflows/prx-release.yml"
+      - ".github/workflows/prx-dumper.yml"
   pull_request:
     paths:
       - "input/**"
-      - ".github/workflows/prx-release.yml"
+      - ".github/workflows/prx-dumper.yml"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  decompile:
+  dump:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout code
+      - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
@@ -29,11 +29,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             openjdk-21-jdk \
-            unzip \
-            curl \
-            jq \
-            file \
-            binutils
+            unzip curl jq \
+            binutils file python3 zip
 
       - name: Download Ghidra
         run: |
@@ -43,26 +40,22 @@ jobs:
               select(.name | test("^ghidra_.*_PUBLIC_.*\\.zip$")) |
               .browser_download_url' | head -n 1)
 
-          if [ -z "$URL" ]; then
-            echo "Ghidra download URL not found"
-            exit 1
-          fi
-
+          test -n "$URL"
           curl -fL "$URL" -o ghidra.zip
           unzip -q ghidra.zip -d ghidra
+
           GHIDRA=$(find ghidra -name analyzeHeadless -type f | head -n 1)
 
-          if [ -z "$GHIDRA" ]; then
-            echo "Ghidra installation failed"
-            exit 1
-          fi
-
+          test -n "$GHIDRA"
+          chmod +x "$GHIDRA"
           echo "GHIDRA=$GHIDRA" >> "$GITHUB_ENV"
 
-      - name: Create decompiler script
+      - name: Create directories
         run: |
-          mkdir -p scripts output
+          mkdir -p input scripts output
 
+      - name: Create Ghidra decompiler
+        run: |
           cat > scripts/Decompile.java <<'JAVA'
           import ghidra.app.decompiler.*;
           import ghidra.app.script.GhidraScript;
@@ -79,8 +72,10 @@ jobs:
 
                   PrintWriter c = new PrintWriter(
                       new File(out, "decompiled.c"));
+
                   PrintWriter symbols = new PrintWriter(
                       new File(out, "symbols.txt"));
+
                   PrintWriter asm = new PrintWriter(
                       new File(out, "assembly.asm"));
 
@@ -97,14 +92,16 @@ jobs:
                       DecompileResults result =
                           dc.decompileFunction(f, 120, monitor);
 
-                      c.println("/* " + f.getName() + " */");
+                      c.println(
+                          "\n/* Function: " + f.getName() + " */");
 
                       if (result.decompileCompleted()
                           && result.getDecompiledFunction() != null) {
                           c.println(
                               result.getDecompiledFunction().getC());
                       } else {
-                          c.println("/* Decompilation unavailable */");
+                          c.println(
+                              "/* Decompilation unavailable */");
                       }
                   }
 
@@ -127,7 +124,6 @@ jobs:
 
       - name: Analyze PRX files
         run: |
-          mkdir -p input output
           FOUND=0
 
           for PRX in input/*.prx; do
@@ -138,12 +134,17 @@ jobs:
             DEST="output/$NAME"
 
             mkdir -p "$DEST"
+
             cp "$PRX" "$DEST/original.prx"
 
             file "$PRX" > "$DEST/file_info.txt"
             strings -a "$PRX" > "$DEST/strings.txt"
-            readelf -a "$PRX" > "$DEST/elf_info.txt" 2>&1 || true
-            objdump -D "$PRX" > "$DEST/disassembly.txt" 2>&1 || true
+
+            readelf -a "$PRX" \
+              > "$DEST/elf_info.txt" 2>&1 || true
+
+            objdump -D "$PRX" \
+              > "$DEST/disassembly.txt" 2>&1 || true
 
             "$GHIDRA" \
               /tmp/ghidra-project \
@@ -152,14 +153,9 @@ jobs:
               -scriptPath scripts \
               -postScript Decompile.java "$DEST" \
               -deleteProject || {
-                echo "Ghidra analysis failed for $NAME"
-                echo "Check PRX format and architecture."
+                echo "Ghidra analysis failed: $NAME"
               }
 
-            (
-              cd "$DEST"
-              sha256sum original.prx > SHA256SUMS.txt
-            )
           done
 
           if [ "$FOUND" -eq 0 ]; then
@@ -167,25 +163,126 @@ jobs:
             exit 1
           fi
 
-      - name: Package dump
+      - name: Generate complete source project
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          root = Path("output")
+
+          for plugin in root.iterdir():
+              if not plugin.is_dir():
+                  continue
+
+              src = plugin / "src"
+              inc = plugin / "include"
+              asm = plugin / "asm"
+              data = plugin / "data"
+              original = plugin / "original"
+
+              for d in (src, inc, asm, data, original):
+                  d.mkdir(parents=True, exist_ok=True)
+
+              def read(name):
+                  p = plugin / name
+                  return p.read_text(errors="replace") if p.exists() else ""
+
+              decompiled = read("decompiled.c")
+              assembly = read("assembly.asm")
+              symbols = read("symbols.txt")
+              strings = read("strings.txt")
+              elf = read("elf_info.txt")
+
+              (src / "main.c").write_text(
+                  "/* Reconstructed pseudocode */\n" + decompiled
+              )
+
+              (src / "functions.c").write_text(
+                  "/* Recovered function output */\n" + decompiled
+              )
+
+              (src / "hooks.c").write_text(
+                  "/* Hook functions require manual identification */\n"
+              )
+
+              (src / "imports.c").write_text(
+                  "/* Imported functions require manual identification */\n"
+              )
+
+              (src / "unknown_functions.c").write_text(
+                  "/* Unknown functions require manual analysis */\n"
+              )
+
+              (inc / "functions.h").write_text(
+                  "#pragma once\n"
+                  "/* Recovered function declarations */\n"
+              )
+
+              (inc / "types.h").write_text(
+                  "#pragma once\n"
+                  "/* Reconstructed types */\n"
+              )
+
+              (inc / "structures.h").write_text(
+                  "#pragma once\n"
+                  "/* Reconstructed structures */\n"
+              )
+
+              (inc / "imports.h").write_text(
+                  "#pragma once\n"
+                  "/* Reconstructed imports */\n"
+              )
+
+              (asm / "main.asm").write_text(assembly)
+              (asm / "functions.asm").write_text(assembly)
+
+              (data / "strings.txt").write_text(strings)
+              (data / "symbols.txt").write_text(symbols)
+              (data / "elf_info.txt").write_text(elf)
+
+              (plugin / "README.md").write_text(
+                  "# GoldHEN PRX Source Dump\n\n"
+                  "Generated through Ghidra static analysis.\n\n"
+                  "The C files contain reconstructed pseudocode, "
+                  "not guaranteed original C/C++ source.\n"
+                  "Some architecture-specific PRX formats may "
+                  "require additional loaders.\n"
+              )
+
+              (plugin / "Makefile").write_text(
+                  "# Reconstructed project - not directly buildable\n"
+                  "all:\n"
+                  "\t@echo 'Original SDK and build configuration required.'\n"
+              )
+
+              binary = plugin / "original.prx"
+
+              if binary.exists():
+                  binary.rename(original / binary.name)
+
+          PY
+
+      - name: Package complete dump
         run: |
           cd output
-          zip -qr ../GoldHEN-PRX-Source-Dump.zip .
+
+          zip -qr ../GoldHEN-Full-Source-Dump.zip .
 
           cd ..
-          sha256sum GoldHEN-PRX-Source-Dump.zip \
-            > GoldHEN-PRX-Source-Dump.sha256
 
-          ls -lh GoldHEN-PRX-Source-Dump.*
+          sha256sum GoldHEN-Full-Source-Dump.zip \
+            > GoldHEN-Full-Source-Dump.sha256
+
+          ls -lh GoldHEN-Full-Source-Dump.*
 
       - name: Upload PR artifact
         if: github.event_name == 'pull_request'
         uses: actions/upload-artifact@v4
         with:
-          name: GoldHEN-PRX-${{ github.sha }}
+          name: GoldHEN-Full-Source-${{ github.sha }}
           path: |
-            GoldHEN-PRX-Source-Dump.zip
-            GoldHEN-PRX-Source-Dump.sha256
+            GoldHEN-Full-Source-Dump.zip
+            GoldHEN-Full-Source-Dump.sha256
 
       - name: Determine release tag
         if: github.event_name != 'pull_request'
@@ -196,12 +293,12 @@ jobs:
             echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
             echo "is_release=true" >> "$GITHUB_OUTPUT"
           else
-            TAG="prx-dump-${GITHUB_RUN_NUMBER}"
+            TAG="goldhen-source-${GITHUB_RUN_NUMBER}"
             echo "tag_name=$TAG" >> "$GITHUB_OUTPUT"
             echo "is_release=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish PRX source dump
+      - name: Publish GitHub Release
         if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -213,23 +310,23 @@ jobs:
           if [ "$IS_REL" = "true" ]; then
             if gh release view "$TAG" >/dev/null 2>&1; then
               gh release upload "$TAG" \
-                GoldHEN-PRX-Source-Dump.zip \
-                GoldHEN-PRX-Source-Dump.sha256 \
+                GoldHEN-Full-Source-Dump.zip \
+                GoldHEN-Full-Source-Dump.sha256 \
                 --clobber
             else
               gh release create "$TAG" \
-                GoldHEN-PRX-Source-Dump.zip \
-                GoldHEN-PRX-Source-Dump.sha256 \
+                GoldHEN-Full-Source-Dump.zip \
+                GoldHEN-Full-Source-Dump.sha256 \
                 --target "$GITHUB_SHA" \
-                --title "GoldHEN PRX Dump $TAG" \
+                --title "GoldHEN Source Dump $TAG" \
                 --generate-notes
             fi
           else
             gh release create "$TAG" \
-              GoldHEN-PRX-Source-Dump.zip \
-              GoldHEN-PRX-Source-Dump.sha256 \
+              GoldHEN-Full-Source-Dump.zip \
+              GoldHEN-Full-Source-Dump.sha256 \
               --target "$GITHUB_SHA" \
-              --title "GoldHEN PRX Dump $TAG" \
+              --title "GoldHEN Source Dump $TAG" \
               --prerelease \
               --generate-notes
           fi
@@ -241,16 +338,16 @@ jobs:
           TAG: ${{ steps.vars.outputs.tag_name }}
         run: |
           URL=$(gh release view "$TAG" --json url --jq .url)
-          SHA=$(sha256sum GoldHEN-PRX-Source-Dump.zip | awk '{print $1}')
+          SHA=$(sha256sum GoldHEN-Full-Source-Dump.zip | awk '{print $1}')
 
           {
             echo "=================================="
-            echo "GOLDHEN PRX DUMP SUCCESSFUL"
+            echo "GOLDHEN SOURCE DUMP SUCCESS"
             echo "=================================="
             echo "Release URL: $URL"
-            echo "SHA-256: $SHA"
+            echo "SHA256: $SHA"
             echo "=================================="
           } | tee -a "$GITHUB_STEP_SUMMARY"
 
-          echo "[Download PRX Source Dump]($URL)" \
+          echo "[Download Full Source Dump]($URL)" \
             >> "$GITHUB_STEP_SUMMARY"
